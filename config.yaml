@@ -1,0 +1,3 @@
+litellm_settings:
+  callbacks:
+    - "custom_callbacks.supabase_usage_logger"
