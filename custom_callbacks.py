@@ -9,6 +9,10 @@ from litellm.integrations.custom_logger import CustomLogger
 
 # Supabase Edge Function URL – set this as an env var in Railway
 SUPABASE_FUNCTION_URL = os.getenv("SUPABASE_LITELLM_USAGE_URL")
+# Optional: Supabase anon key (default auth for public edge function)
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+# Optional: Supabase service role key for authenticated edge functions
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 
 class SupabaseUsageLogger(CustomLogger):
@@ -40,6 +44,7 @@ class SupabaseUsageLogger(CustomLogger):
         start_time: float,
         end_time: float,
     ):
+        print("[SupabaseUsageLogger] 🔔 async_log_success_event called!")
         await self._send_event("success", kwargs, response_obj)
 
     async def async_log_failure_event(
@@ -49,6 +54,7 @@ class SupabaseUsageLogger(CustomLogger):
         start_time: float,
         end_time: float,
     ):
+        print("[SupabaseUsageLogger] 🔔 async_log_failure_event called!")
         await self._send_event("failure", kwargs, response_obj)
 
     # Optional sync versions (LiteLLM may call these in some paths)
@@ -59,7 +65,8 @@ class SupabaseUsageLogger(CustomLogger):
         start_time: float,
         end_time: float,
     ):
-        asyncio.run(self._send_event("success", kwargs, response_obj))
+        print("[SupabaseUsageLogger] 🔔 log_success_event (sync) called!")
+        self._run_sync("success", kwargs, response_obj)
 
     def log_failure_event(
         self,
@@ -68,7 +75,8 @@ class SupabaseUsageLogger(CustomLogger):
         start_time: float,
         end_time: float,
     ):
-        asyncio.run(self._send_event("failure", kwargs, response_obj))
+        print("[SupabaseUsageLogger] 🔔 log_failure_event (sync) called!")
+        self._run_sync("failure", kwargs, response_obj)
 
     # --------- Internal helpers ----------
 
@@ -80,25 +88,37 @@ class SupabaseUsageLogger(CustomLogger):
     ):
         # If env var isn’t set, just do nothing
         if not SUPABASE_FUNCTION_URL:
-            print("[SupabaseUsageLogger] SUPABASE_LITELLM_USAGE_URL not set, skipping")
+            print("[SupabaseUsageLogger] ⚠️  SUPABASE_LITELLM_USAGE_URL not set, skipping")
             return
 
         try:
             payload = self._build_payload(status, kwargs, response_obj)
+            print(f"[SupabaseUsageLogger] 📤 Sending {status} event to Supabase")
+            print(f"[SupabaseUsageLogger] Payload: {json.dumps(payload, indent=2)}")
         except Exception as e:
-            print("[SupabaseUsageLogger] Error building payload:", e)
+            print(f"[SupabaseUsageLogger] ❌ Error building payload: {e}")
             return
 
         try:
+            # Build headers - add auth if service / anon key is provided
+            headers = {"Content-Type": "application/json"}
+            # Prefer the anon key unless the service role key is explicitly required
+            supabase_auth_key = SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY
+            if supabase_auth_key:
+                headers["Authorization"] = f"Bearer {supabase_auth_key}"
+                headers["apikey"] = supabase_auth_key
+
             async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.post(SUPABASE_FUNCTION_URL, json=payload)
+                r = await client.post(SUPABASE_FUNCTION_URL, json=payload, headers=headers)
                 if r.status_code >= 400:
                     print(
-                        f"[SupabaseUsageLogger] Supabase returned {r.status_code}: {r.text}"
+                        f"[SupabaseUsageLogger] ❌ Supabase returned {r.status_code}: {r.text}"
                     )
+                else:
+                    print(f"[SupabaseUsageLogger] ✅ Successfully sent to Supabase (status: {r.status_code})")
         except Exception as e:
             # Don’t break user requests if logging fails
-            print("[SupabaseUsageLogger] Error sending to Supabase:", e)
+            print(f"[SupabaseUsageLogger] ❌ Error sending to Supabase: {e}")
 
     def _build_payload(
         self,
@@ -167,6 +187,18 @@ class SupabaseUsageLogger(CustomLogger):
         # }
 
         return payload
+
+    def _run_sync(self, status: str, kwargs: Dict[str, Any], response_obj: Any):
+        """
+        Helper to bridge sync callbacks when we're already inside an event loop (uvicorn).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._send_event(status, kwargs, response_obj))
+            return
+
+        loop.create_task(self._send_event(status, kwargs, response_obj))
 
 
 # Instance that LiteLLM will reference in config:
